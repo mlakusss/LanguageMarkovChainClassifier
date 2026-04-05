@@ -5,23 +5,17 @@ using System.Text.RegularExpressions;
 
 namespace kursachm
 {
-    /// <summary>
-    /// Классификатор языка на основе марковской цепи порядка k с back-off (без сглаживания).
-    /// Если переход для контекста длины k отсутствует, используется контекст длины k-1 и т.д.
-    /// </summary>
     public class MarkovChainBackoffClassifier
     {
         private readonly int maxOrder;
         private readonly double quoteWeight;
-        private readonly double fallbackProb; // вероятность для полностью неизвестного символа
+        private readonly double fallbackProb;
 
-        // Структура: для каждого языка и для каждого порядка (1..maxOrder) храним:
-        //   - для контекста (строка длины order) -> словарь (следующий символ -> взвешенная частота)
-        //   - общую сумму частот для контекста
+        // Для каждого языка: для каждого порядка (1..maxOrder) -> контекст -> (символ -> частота)
         private Dictionary<string, Dictionary<int, Dictionary<string, Dictionary<char, double>>>> transitions;
         private Dictionary<string, Dictionary<int, Dictionary<string, double>>> contextTotals;
         private Dictionary<string, int> languageDocCount;
-        private HashSet<char> globalAlphabet; // все символы, встреченные в обучении (для fallback)
+        private Dictionary<string, HashSet<char>> languageAlphabets; // какие символы встречались в языке
 
         public MarkovChainBackoffClassifier(int maxOrder = 4, double quoteWeight = 0.05, double fallbackProb = 1e-9)
         {
@@ -31,7 +25,7 @@ namespace kursachm
             transitions = new Dictionary<string, Dictionary<int, Dictionary<string, Dictionary<char, double>>>>();
             contextTotals = new Dictionary<string, Dictionary<int, Dictionary<string, double>>>();
             languageDocCount = new Dictionary<string, int>();
-            globalAlphabet = new HashSet<char>();
+            languageAlphabets = new Dictionary<string, HashSet<char>>();
         }
 
         private IEnumerable<(string fragment, double weight)> SplitQuotes(string text)
@@ -70,7 +64,6 @@ namespace kursachm
             return cleaned;
         }
 
-        // Подготовка текста: добавление маркеров начала (символ '#') порядка maxOrder
         private string PrepareText(string text)
         {
             string cleaned = CleanText(text);
@@ -83,7 +76,7 @@ namespace kursachm
             transitions.Clear();
             contextTotals.Clear();
             languageDocCount.Clear();
-            globalAlphabet.Clear();
+            languageAlphabets.Clear();
 
             foreach (var doc in documents)
             {
@@ -93,6 +86,7 @@ namespace kursachm
                     languageDocCount[lang] = 0;
                     transitions[lang] = new Dictionary<int, Dictionary<string, Dictionary<char, double>>>();
                     contextTotals[lang] = new Dictionary<int, Dictionary<string, double>>();
+                    languageAlphabets[lang] = new HashSet<char>();
                     for (int order = 1; order <= maxOrder; order++)
                     {
                         transitions[lang][order] = new Dictionary<string, Dictionary<char, double>>();
@@ -104,21 +98,22 @@ namespace kursachm
                 var fragments = SplitQuotes(doc.Text).ToList();
                 foreach (var (fragment, weight) in fragments)
                 {
+                    string cleaned = CleanText(fragment);
+                    if (string.IsNullOrEmpty(cleaned)) continue;
+
+                    // Собираем алфавит языка
+                    foreach (char c in cleaned)
+                        if (char.IsLetter(c))
+                            languageAlphabets[lang].Add(c);
+
                     string prepared = PrepareText(fragment);
                     if (prepared.Length <= maxOrder) continue;
 
-                    // Для каждого порядка (от 1 до maxOrder) собираем статистику переходов
-                    // Но эффективнее: сначала собрать для maxOrder, а потом для меньших порядков использовать те же данные?
-                    // Поступим проще: для каждой позиции i (от maxOrder до длины-1) извлекаем все суффиксы контекстов.
                     for (int i = maxOrder; i < prepared.Length; i++)
                     {
                         char nextChar = prepared[i];
-                        globalAlphabet.Add(nextChar);
-
-                        // Для каждого порядка от 1 до maxOrder
                         for (int order = 1; order <= maxOrder; order++)
                         {
-                            // Контекст: order символов, заканчивающихся на позиции i-1
                             string context = prepared.Substring(i - order, order);
                             var transDict = transitions[lang][order];
                             var totalDict = contextTotals[lang][order];
@@ -138,10 +133,8 @@ namespace kursachm
             }
         }
 
-        // Получение вероятности P(next | context) с back-off
         private double GetProbability(string lang, string context, char next, int order)
         {
-            // Пытаемся найти переход на текущем порядке
             if (transitions[lang].ContainsKey(order) && transitions[lang][order].ContainsKey(context))
             {
                 var dict = transitions[lang][order][context];
@@ -151,26 +144,18 @@ namespace kursachm
                     return dict[next] / total;
                 }
             }
-            // Если не нашли и порядок > 1, рекурсивно пробуем укороченный контекст
             if (order > 1)
             {
-                string shorterContext = context.Substring(1); // убираем первый символ
+                string shorterContext = context.Substring(1);
                 return GetProbability(lang, shorterContext, next, order - 1);
             }
-            // Если дошли до униграммы (order=1) и её нет — возвращаем очень маленькую вероятность
-            // Можно также использовать глобальную частоту символа, но для простоты — fallbackProb
             return fallbackProb;
         }
 
-        // Логарифмическая вероятность текста для языка
         private double LogProbability(string text, string lang)
         {
-            string prepared = PrepareText(text);
-            if (prepared.Length <= maxOrder) return double.NegativeInfinity;
-
             double logProb = 0.0;
-            var fragments = SplitQuotes(text).ToList(); // нужно для весов, но PrepareText уже сделал очистку
-            // Упростим: будем считать веса для каждого фрагмента отдельно
+            var fragments = SplitQuotes(text).ToList();
             foreach (var (fragment, weight) in fragments)
             {
                 string prep = PrepareText(fragment);
@@ -187,14 +172,40 @@ namespace kursachm
             return logProb;
         }
 
+        // Фильтрация языков по алфавиту текста
+        private IEnumerable<string> FilterLanguagesByAlphabet(string text, IEnumerable<string> candidates)
+        {
+            // Определяем буквы в тексте (после очистки, но без маркеров)
+            string cleaned = CleanText(text);
+            var textLetters = new HashSet<char>();
+            foreach (char c in cleaned)
+                if (char.IsLetter(c))
+                    textLetters.Add(char.ToLowerInvariant(c));
+
+            if (textLetters.Count == 0) return candidates;
+
+            var result = new List<string>();
+            foreach (var lang in candidates)
+            {
+                if (!languageAlphabets.ContainsKey(lang)) continue;
+                if (languageAlphabets[lang].Overlaps(textLetters))
+                    result.Add(lang);
+            }
+            return result.Count > 0 ? result : candidates;
+        }
+
         public (string BestLanguage, double Confidence, List<(string Lang, double LogProb, double Prob)> TopCandidates) Classify(string text)
         {
             if (languageDocCount.Count == 0) return (null, 0, null);
 
             int totalDocs = languageDocCount.Values.Sum();
-            var logScores = new Dictionary<string, double>();
 
-            foreach (var lang in languageDocCount.Keys)
+            // Применяем фильтрацию по алфавиту
+            var candidates = FilterLanguagesByAlphabet(text, languageDocCount.Keys);
+            if (!candidates.Any()) candidates = languageDocCount.Keys;
+
+            var logScores = new Dictionary<string, double>();
+            foreach (var lang in candidates)
             {
                 double prior = Math.Log((double)languageDocCount[lang] / totalDocs);
                 double likelihood = LogProbability(text, lang);
