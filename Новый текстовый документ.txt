@@ -1,0 +1,242 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text.RegularExpressions;
+
+namespace kursachm
+{
+    /// <summary>
+    /// Представляет документ с текстом и меткой языка.
+    /// </summary>
+    public class LanguageDocument
+    {
+        public string Text { get; set; }
+        public string Language { get; set; }
+
+        public LanguageDocument(string text, string language)
+        {
+            Text = text;
+            Language = language;
+        }
+    }
+
+    /// <summary>
+    /// Извлекает символьные N-граммы из текста с учётом весов фрагментов (цитаты имеют пониженный вес).
+    /// </summary>
+    public static class NGramExtractor
+    {
+        private const int DefaultN = 4;
+        private const double QuoteWeight = 0.05; // вес цитат (подобран экспериментально)
+
+        /// <summary>
+        /// Извлекает n-граммы из текста, разбивая его на основной текст и цитаты.
+        /// Возвращает последовательность n-грамм с их весами.
+        /// </summary>
+        public static IEnumerable<(string ngram, double weight)> ExtractWeighted(string text, int n = DefaultN)
+        {
+            var fragments = SplitQuotes(text);
+            foreach (var (fragment, weight) in fragments)
+            {
+                if (string.IsNullOrWhiteSpace(fragment) || fragment.Length < n)
+                    continue;
+
+                string cleaned = CleanText(fragment);
+                if (cleaned.Length < n)
+                    continue;
+
+                for (int i = 0; i <= cleaned.Length - n; i++)
+                {
+                    yield return (cleaned.Substring(i, n), weight);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Очистка текста: оставляем только буквы и пробелы, приводим к нижнему регистру.
+        /// </summary>
+        private static string CleanText(string text)
+        {
+            string cleaned = Regex.Replace(text, @"[^a-zA-Zа-яА-Я\s]", " ");
+            cleaned = Regex.Replace(cleaned, @"\s+", " ").Trim().ToLowerInvariant();
+            return cleaned;
+        }
+
+        /// <summary>
+        /// Разбивает текст на фрагменты: основной текст (вес 1.0) и цитаты (вес QuoteWeight).
+        /// Поддерживаются кавычки «...», "...", и “...” (английские типографские).
+        /// </summary>
+        private static IEnumerable<(string fragment, double weight)> SplitQuotes(string text)
+        {
+            var regex = new Regex(@"«([^»]*)»|""([^""]*)""|“([^”]*)”", RegexOptions.Singleline);
+            int lastIndex = 0;
+
+            foreach (Match match in regex.Matches(text))
+            {
+                // Основной текст до цитаты
+                if (match.Index > lastIndex)
+                {
+                    string before = text.Substring(lastIndex, match.Index - lastIndex);
+                    if (!string.IsNullOrWhiteSpace(before))
+                        yield return (before, 1.0);
+                }
+
+                // Цитата (содержимое без кавычек)
+                string quote = null;
+                if (match.Groups[1].Success) quote = match.Groups[1].Value;
+                else if (match.Groups[2].Success) quote = match.Groups[2].Value;
+                else if (match.Groups[3].Success) quote = match.Groups[3].Value;
+
+                if (!string.IsNullOrWhiteSpace(quote))
+                    yield return (quote, QuoteWeight);
+
+                lastIndex = match.Index + match.Length;
+            }
+
+            if (lastIndex < text.Length)
+            {
+                string after = text.Substring(lastIndex);
+                if (!string.IsNullOrWhiteSpace(after))
+                    yield return (after, 1.0);
+            }
+        }
+
+        // Для обратной совместимости (не используется в основных методах)
+        public static IEnumerable<string> Extract(string text, int n = DefaultN)
+        {
+            return ExtractWeighted(text, n).Select(x => x.ngram);
+        }
+    }
+
+    /// <summary>
+    /// Многоклассовый наивный байесовский классификатор для определения языка текста.
+    /// Использует аддитивное сглаживание с параметром Alpha (по умолчанию 0.1) и учитывает веса n-грамм.
+    /// </summary>
+    public class LanguageClassifier
+    {
+        private HashSet<string> vocabulary;
+        private Dictionary<string, int> languageDocCount;
+        private Dictionary<string, Dictionary<string, double>> languageNgramCounts; // взвешенные частоты
+        private Dictionary<string, double> languageTotalNgrams;
+        private double alpha;
+
+        public LanguageClassifier(double alpha = 0.1)
+        {
+            this.alpha = alpha;
+            vocabulary = new HashSet<string>();
+            languageDocCount = new Dictionary<string, int>();
+            languageNgramCounts = new Dictionary<string, Dictionary<string, double>>();
+            languageTotalNgrams = new Dictionary<string, double>();
+        }
+
+        /// <summary>
+        /// Обучает классификатор на коллекции документов.
+        /// </summary>
+        public void Train(IEnumerable<LanguageDocument> documents)
+        {
+            vocabulary.Clear();
+            languageDocCount.Clear();
+            languageNgramCounts.Clear();
+            languageTotalNgrams.Clear();
+
+            foreach (var doc in documents)
+            {
+                var weightedNgrams = NGramExtractor.ExtractWeighted(doc.Text).ToList();
+
+                if (!languageNgramCounts.ContainsKey(doc.Language))
+                {
+                    languageNgramCounts[doc.Language] = new Dictionary<string, double>();
+                    languageDocCount[doc.Language] = 0;
+                    languageTotalNgrams[doc.Language] = 0.0;
+                }
+
+                languageDocCount[doc.Language]++;
+
+                foreach (var (ngram, weight) in weightedNgrams)
+                {
+                    vocabulary.Add(ngram);
+
+                    var counts = languageNgramCounts[doc.Language];
+                    if (!counts.ContainsKey(ngram))
+                        counts[ngram] = 0.0;
+                    counts[ngram] += weight;
+
+                    languageTotalNgrams[doc.Language] += weight;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Вычисляет априорную вероятность языка.
+        /// </summary>
+        private double PriorProbability(string language)
+        {
+            int totalDocs = languageDocCount.Values.Sum();
+            if (totalDocs == 0) return 0;
+            return (double)languageDocCount[language] / totalDocs;
+        }
+
+        /// <summary>
+        /// Вычисляет условную вероятность N-граммы для данного языка с аддитивным сглаживанием.
+        /// </summary>
+        private double ConditionalProbability(string ngram, string language)
+        {
+            double count = 0;
+            if (languageNgramCounts[language].TryGetValue(ngram, out double c))
+                count = c;
+
+            double total = languageTotalNgrams[language];
+            return (count + alpha) / (total + alpha * vocabulary.Count);
+        }
+
+        /// <summary>
+        /// Классифицирует текст и возвращает наиболее вероятный язык, уверенность и топ-5 кандидатов.
+        /// </summary>
+        public (string BestLanguage, double Confidence, List<(string Lang, double LogScore, double Prob)> TopCandidates) Classify(string text)
+        {
+            if (languageDocCount.Count == 0)
+                return (null, 0, null);
+
+            var weightedNgrams = NGramExtractor.ExtractWeighted(text).ToList();
+            var logScores = new Dictionary<string, double>();
+
+            foreach (var lang in languageDocCount.Keys)
+            {
+                double logProb = Math.Log(PriorProbability(lang));
+
+                foreach (var (ngram, weight) in weightedNgrams)
+                {
+                    if (!vocabulary.Contains(ngram))
+                        continue; // n-грамма не встречалась ни в одном языке – пропускаем
+
+                    double condProb = ConditionalProbability(ngram, lang);
+                    logProb += weight * Math.Log(condProb);
+                }
+
+                logScores[lang] = logProb;
+            }
+
+            var topCandidates = logScores
+                .OrderByDescending(kv => kv.Value)
+                .Take(5)
+                .Select(kv => (Lang: kv.Key, LogScore: kv.Value, Prob: 0.0))
+                .ToList();
+
+            double maxScore = topCandidates.First().LogScore;
+            double sumExp = 0;
+            foreach (var t in topCandidates)
+                sumExp += Math.Exp(t.LogScore - maxScore);
+
+            var topWithProb = topCandidates
+                .Select(t => (Lang: t.Lang, LogScore: t.LogScore, Prob: Math.Exp(t.LogScore - maxScore) / sumExp))
+                .ToList();
+
+            string bestLang = topWithProb.First().Lang;
+            double confidence = topWithProb.First().Prob;
+
+            return (bestLang, confidence, topWithProb);
+        }
+
+        public IEnumerable<string> GetLanguages() => languageDocCount.Keys;
+        public int VocabularySize => vocabulary.Count;
+    }
+}
