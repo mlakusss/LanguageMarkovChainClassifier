@@ -6,12 +6,20 @@ using System.Text.RegularExpressions;
 
 namespace kursachm
 {
+    /// <summary>
+    /// Классификатор языка на основе марковской цепи порядка k с back-off (без сглаживания).
+    /// Для каждого языка хранятся переходы для контекстов максимальной длины.
+    /// При отсутствии перехода контекст усекается слева (back-off) до длины 1.
+    /// Алфавитная фильтрация: учитываются только языки, чей алфавит пересекается с буквами текста.
+    /// Цитаты имеют пониженный вес.
+    /// </summary>
     public class MarkovChainBackoffClassifier
     {
         private readonly int maxOrder;
         private readonly double quoteWeight;
         private readonly double fallbackProb;
 
+        // Для каждого языка: контекст -> (следующий символ -> взвешенная частота)
         private Dictionary<string, Dictionary<string, Dictionary<char, double>>> transitions;
         private Dictionary<string, Dictionary<string, double>> contextTotals;
         private Dictionary<string, int> languageDocCount;
@@ -28,6 +36,9 @@ namespace kursachm
             languageAlphabets = new Dictionary<string, HashSet<char>>();
         }
 
+        /// <summary> 
+        /// Разбивает текст на основной текст (вес 1) и цитаты (вес quoteWeight)
+        /// </summary>
         private IEnumerable<(string fragment, double weight)> SplitQuotes(string text)
         {
             var regex = new Regex(@"«([^»]*)»|""([^""]*)""|“([^”]*)”", RegexOptions.Singleline);
@@ -56,6 +67,9 @@ namespace kursachm
             }
         }
 
+        /// <summary> 
+        /// Очистка текста для n-грамм: только буквы и пробелы, нижний регистр 
+        /// </summary>
         private string CleanTextForNGrams(string text)
         {
             if (string.IsNullOrWhiteSpace(text)) return "";
@@ -72,6 +86,9 @@ namespace kursachm
             return result;
         }
 
+        /// <summary> 
+        /// Добавляет маркеры начала # для марковской цепи 
+        /// </summary>
         private string PrepareText(string text)
         {
             string cleaned = CleanTextForNGrams(text);
@@ -79,6 +96,9 @@ namespace kursachm
             return new string('#', maxOrder) + cleaned;
         }
 
+        /// <summary> 
+        /// Обучение модели на коллекции документов 
+        /// </summary>
         public void Train(IEnumerable<LanguageDocument> documents)
         {
             transitions.Clear();
@@ -101,7 +121,7 @@ namespace kursachm
                 var fragments = SplitQuotes(doc.Text).ToList();
                 foreach (var (fragment, weight) in fragments)
                 {
-                    // Алфавит
+                    // Сбор алфавита языка (из оригинального текста)
                     foreach (char c in fragment)
                         if (char.IsLetter(c))
                             languageAlphabets[lang].Add(char.ToLowerInvariant(c));
@@ -128,9 +148,11 @@ namespace kursachm
             }
         }
 
+        /// <summary> 
+        /// Вероятность перехода с back-off (усечение контекста) 
+        /// </summary>
         private double GetProbability(string lang, string fullContext, char next)
         {
-            // Пробуем контексты от maxOrder до 1
             for (int order = maxOrder; order >= 1; order--)
             {
                 if (fullContext.Length < order) continue;
@@ -148,6 +170,9 @@ namespace kursachm
             return fallbackProb;
         }
 
+        /// <summary> 
+        /// Суммарная логарифмическая вероятность текста для языка 
+        /// </summary>
         private double LogProbability(string text, string lang)
         {
             double logProbSum = 0.0;
@@ -168,6 +193,9 @@ namespace kursachm
             return logProbSum;
         }
 
+        /// <summary> 
+        /// Мягкая фильтрация языков по алфавиту (пересечение множеств букв) 
+        /// </summary>
         private IEnumerable<string> FilterLanguagesByAlphabet(string text, IEnumerable<string> candidates)
         {
             var textLetters = new HashSet<char>();
@@ -181,13 +209,15 @@ namespace kursachm
             foreach (var lang in candidates)
             {
                 if (!languageAlphabets.ContainsKey(lang)) continue;
-                var langLetters = languageAlphabets[lang];
-                if (langLetters.Overlaps(textLetters))
+                if (languageAlphabets[lang].Overlaps(textLetters))
                     result.Add(lang);
             }
             return result.Count > 0 ? result : candidates;
         }
 
+        /// <summary> 
+        /// Классификация текста: возвращает лучший язык, уверенность и топ‑5 
+        /// </summary>
         public (string BestLanguage, double Confidence, List<(string Lang, double LogProb, double Prob)> TopCandidates) Classify(string text)
         {
             if (languageDocCount.Count == 0) return (null, 0, null);

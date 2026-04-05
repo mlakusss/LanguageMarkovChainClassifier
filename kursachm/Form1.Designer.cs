@@ -107,7 +107,7 @@
             // 
             // txtLog
             // 
-            txtLog.Location = new Point(12, 80);
+            txtLog.Location = new Point(12, 76);
             txtLog.Multiline = true;
             txtLog.Name = "txtLog";
             txtLog.ReadOnly = true;
