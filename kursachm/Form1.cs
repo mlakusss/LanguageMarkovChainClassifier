@@ -8,13 +8,12 @@ namespace kursachm
 {
     public partial class Form1 : Form
     {
-        private MarkovChainBackoffClassifier classifier;   // изменён тип
+        private MarkovChainBackoffClassifier classifier;
 
         public Form1()
         {
             InitializeComponent();
-            // Параметры: порядок цепи = 4, вес цитат = 0.05, fallbackProb = 1e-9
-            classifier = new MarkovChainBackoffClassifier(maxOrder: 4, quoteWeight: 0.05);
+            classifier = new MarkovChainBackoffClassifier(maxOrder: 6, quoteWeight: 0.05, fallbackProb: 1e-9);
         }
 
         private void BtnSelectTrainFolder_Click(object sender, EventArgs e)

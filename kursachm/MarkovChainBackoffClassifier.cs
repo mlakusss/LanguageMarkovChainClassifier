@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Text;
 using System.Text.RegularExpressions;
 
 namespace kursachm
@@ -11,19 +12,18 @@ namespace kursachm
         private readonly double quoteWeight;
         private readonly double fallbackProb;
 
-        // Для каждого языка: для каждого порядка (1..maxOrder) -> контекст -> (символ -> частота)
-        private Dictionary<string, Dictionary<int, Dictionary<string, Dictionary<char, double>>>> transitions;
-        private Dictionary<string, Dictionary<int, Dictionary<string, double>>> contextTotals;
+        private Dictionary<string, Dictionary<string, Dictionary<char, double>>> transitions;
+        private Dictionary<string, Dictionary<string, double>> contextTotals;
         private Dictionary<string, int> languageDocCount;
-        private Dictionary<string, HashSet<char>> languageAlphabets; // какие символы встречались в языке
+        private Dictionary<string, HashSet<char>> languageAlphabets;
 
-        public MarkovChainBackoffClassifier(int maxOrder = 4, double quoteWeight = 0.05, double fallbackProb = 1e-9)
+        public MarkovChainBackoffClassifier(int maxOrder = 6, double quoteWeight = 0.05, double fallbackProb = 1e-9)
         {
             this.maxOrder = maxOrder;
             this.quoteWeight = quoteWeight;
             this.fallbackProb = fallbackProb;
-            transitions = new Dictionary<string, Dictionary<int, Dictionary<string, Dictionary<char, double>>>>();
-            contextTotals = new Dictionary<string, Dictionary<int, Dictionary<string, double>>>();
+            transitions = new Dictionary<string, Dictionary<string, Dictionary<char, double>>>();
+            contextTotals = new Dictionary<string, Dictionary<string, double>>();
             languageDocCount = new Dictionary<string, int>();
             languageAlphabets = new Dictionary<string, HashSet<char>>();
         }
@@ -56,17 +56,25 @@ namespace kursachm
             }
         }
 
-        private string CleanText(string text)
+        private string CleanTextForNGrams(string text)
         {
             if (string.IsNullOrWhiteSpace(text)) return "";
-            string cleaned = Regex.Replace(text, @"[^a-zA-Zа-яА-Я\s]", " ");
-            cleaned = Regex.Replace(cleaned, @"\s+", " ").Trim().ToLowerInvariant();
-            return cleaned;
+            var sb = new StringBuilder();
+            foreach (char c in text)
+            {
+                if (char.IsLetter(c) || char.IsWhiteSpace(c))
+                    sb.Append(c);
+                else
+                    sb.Append(' ');
+            }
+            string result = sb.ToString();
+            result = Regex.Replace(result, @"\s+", " ").Trim().ToLowerInvariant();
+            return result;
         }
 
         private string PrepareText(string text)
         {
-            string cleaned = CleanText(text);
+            string cleaned = CleanTextForNGrams(text);
             if (string.IsNullOrEmpty(cleaned)) return "";
             return new string('#', maxOrder) + cleaned;
         }
@@ -84,77 +92,65 @@ namespace kursachm
                 if (!languageDocCount.ContainsKey(lang))
                 {
                     languageDocCount[lang] = 0;
-                    transitions[lang] = new Dictionary<int, Dictionary<string, Dictionary<char, double>>>();
-                    contextTotals[lang] = new Dictionary<int, Dictionary<string, double>>();
+                    transitions[lang] = new Dictionary<string, Dictionary<char, double>>();
+                    contextTotals[lang] = new Dictionary<string, double>();
                     languageAlphabets[lang] = new HashSet<char>();
-                    for (int order = 1; order <= maxOrder; order++)
-                    {
-                        transitions[lang][order] = new Dictionary<string, Dictionary<char, double>>();
-                        contextTotals[lang][order] = new Dictionary<string, double>();
-                    }
                 }
                 languageDocCount[lang]++;
 
                 var fragments = SplitQuotes(doc.Text).ToList();
                 foreach (var (fragment, weight) in fragments)
                 {
-                    string cleaned = CleanText(fragment);
-                    if (string.IsNullOrEmpty(cleaned)) continue;
-
-                    // Собираем алфавит языка
-                    foreach (char c in cleaned)
+                    // Алфавит
+                    foreach (char c in fragment)
                         if (char.IsLetter(c))
-                            languageAlphabets[lang].Add(c);
+                            languageAlphabets[lang].Add(char.ToLowerInvariant(c));
 
                     string prepared = PrepareText(fragment);
                     if (prepared.Length <= maxOrder) continue;
 
                     for (int i = maxOrder; i < prepared.Length; i++)
                     {
+                        string context = prepared.Substring(i - maxOrder, maxOrder);
                         char nextChar = prepared[i];
-                        for (int order = 1; order <= maxOrder; order++)
-                        {
-                            string context = prepared.Substring(i - order, order);
-                            var transDict = transitions[lang][order];
-                            var totalDict = contextTotals[lang][order];
 
-                            if (!transDict.ContainsKey(context))
-                            {
-                                transDict[context] = new Dictionary<char, double>();
-                                totalDict[context] = 0;
-                            }
-                            if (!transDict[context].ContainsKey(nextChar))
-                                transDict[context][nextChar] = 0;
-                            transDict[context][nextChar] += weight;
-                            totalDict[context] += weight;
+                        if (!transitions[lang].ContainsKey(context))
+                        {
+                            transitions[lang][context] = new Dictionary<char, double>();
+                            contextTotals[lang][context] = 0;
                         }
+                        if (!transitions[lang][context].ContainsKey(nextChar))
+                            transitions[lang][context][nextChar] = 0;
+                        transitions[lang][context][nextChar] += weight;
+                        contextTotals[lang][context] += weight;
                     }
                 }
             }
         }
 
-        private double GetProbability(string lang, string context, char next, int order)
+        private double GetProbability(string lang, string fullContext, char next)
         {
-            if (transitions[lang].ContainsKey(order) && transitions[lang][order].ContainsKey(context))
+            // Пробуем контексты от maxOrder до 1
+            for (int order = maxOrder; order >= 1; order--)
             {
-                var dict = transitions[lang][order][context];
-                if (dict.ContainsKey(next))
+                if (fullContext.Length < order) continue;
+                string context = fullContext.Substring(fullContext.Length - order, order);
+                if (transitions[lang].ContainsKey(context))
                 {
-                    double total = contextTotals[lang][order][context];
-                    return dict[next] / total;
+                    var dict = transitions[lang][context];
+                    if (dict.ContainsKey(next))
+                    {
+                        double total = contextTotals[lang][context];
+                        return dict[next] / total;
+                    }
                 }
-            }
-            if (order > 1)
-            {
-                string shorterContext = context.Substring(1);
-                return GetProbability(lang, shorterContext, next, order - 1);
             }
             return fallbackProb;
         }
 
         private double LogProbability(string text, string lang)
         {
-            double logProb = 0.0;
+            double logProbSum = 0.0;
             var fragments = SplitQuotes(text).ToList();
             foreach (var (fragment, weight) in fragments)
             {
@@ -164,21 +160,18 @@ namespace kursachm
                 {
                     string context = prep.Substring(i - maxOrder, maxOrder);
                     char next = prep[i];
-                    double p = GetProbability(lang, context, next, maxOrder);
+                    double p = GetProbability(lang, context, next);
                     if (p <= 0) p = fallbackProb;
-                    logProb += weight * Math.Log(p);
+                    logProbSum += weight * Math.Log(p);
                 }
             }
-            return logProb;
+            return logProbSum;
         }
 
-        // Фильтрация языков по алфавиту текста
         private IEnumerable<string> FilterLanguagesByAlphabet(string text, IEnumerable<string> candidates)
         {
-            // Определяем буквы в тексте (после очистки, но без маркеров)
-            string cleaned = CleanText(text);
             var textLetters = new HashSet<char>();
-            foreach (char c in cleaned)
+            foreach (char c in text)
                 if (char.IsLetter(c))
                     textLetters.Add(char.ToLowerInvariant(c));
 
@@ -188,7 +181,8 @@ namespace kursachm
             foreach (var lang in candidates)
             {
                 if (!languageAlphabets.ContainsKey(lang)) continue;
-                if (languageAlphabets[lang].Overlaps(textLetters))
+                var langLetters = languageAlphabets[lang];
+                if (langLetters.Overlaps(textLetters))
                     result.Add(lang);
             }
             return result.Count > 0 ? result : candidates;
@@ -199,20 +193,18 @@ namespace kursachm
             if (languageDocCount.Count == 0) return (null, 0, null);
 
             int totalDocs = languageDocCount.Values.Sum();
-
-            // Применяем фильтрацию по алфавиту
             var candidates = FilterLanguagesByAlphabet(text, languageDocCount.Keys);
             if (!candidates.Any()) candidates = languageDocCount.Keys;
 
-            var logScores = new Dictionary<string, double>();
+            var scores = new Dictionary<string, double>();
             foreach (var lang in candidates)
             {
                 double prior = Math.Log((double)languageDocCount[lang] / totalDocs);
                 double likelihood = LogProbability(text, lang);
-                logScores[lang] = prior + likelihood;
+                scores[lang] = prior + likelihood;
             }
 
-            var topCandidates = logScores
+            var topCandidates = scores
                 .OrderByDescending(kv => kv.Value)
                 .Take(5)
                 .Select(kv => (Lang: kv.Key, LogProb: kv.Value, Prob: 0.0))
