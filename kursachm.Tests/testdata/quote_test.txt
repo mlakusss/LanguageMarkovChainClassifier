@@ -1,0 +1,3 @@
+Привет! Это короткое введение.
+"English is a very long language that contains many words and sentences. The quick brown fox jumps over the lazy dog. This is an example of a long quote in English that takes up most of the text. It includes several sentences and is deliberately long to test the weighting mechanism. We want to see if the classifier still detects the main language as Russian despite the quote being longer."
+Конец.
