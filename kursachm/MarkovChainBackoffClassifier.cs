@@ -1,132 +1,65 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Text;
-using System.Text.RegularExpressions;
 
 namespace kursachm
 {
     /// <summary>
-    /// Классификатор языка на основе марковской цепи порядка k с back-off (без сглаживания).
-    /// Для каждого языка хранятся переходы для контекстов максимальной длины.
-    /// При отсутствии перехода контекст усекается слева (back-off) до длины 1.
-    /// Алфавитная фильтрация: учитываются только языки, чей алфавит пересекается с буквами текста.
-    /// Цитаты имеют пониженный вес.
+    /// Классификатор языка на основе марковской цепи порядка k с механизмом back-off.
+    /// Поддерживает обучение на размеченных документах, фильтрацию по алфавиту,
+    /// пониженный вес цитат и возврат вероятности для топ-5 кандидатов.
     /// </summary>
     public class MarkovChainBackoffClassifier
     {
         private readonly int maxOrder;
         private readonly double quoteWeight;
         private readonly double fallbackProb;
+        private readonly TextPreprocessor preprocessor;
+        private MarkovModelData model;
 
-        // Для каждого языка: контекст -> (следующий символ -> взвешенная частота)
-        private Dictionary<string, Dictionary<string, Dictionary<char, double>>> transitions;
-        private Dictionary<string, Dictionary<string, double>> contextTotals;
-        private Dictionary<string, int> languageDocCount;
-        private Dictionary<string, HashSet<char>> languageAlphabets;
-
+        /// <summary>
+        /// Инициализирует новый экземпляр классификатора с заданными параметрами.
+        /// </summary>
+        /// <param name="maxOrder">Максимальная длина контекста (порядок цепи). По умолчанию 6.</param>
+        /// <param name="quoteWeight">Вес цитат (основной текст имеет вес 1.0). По умолчанию 0.05.</param>
+        /// <param name="fallbackProb">Вероятность возврата при отсутствии перехода. По умолчанию 1e-9.</param>
         public MarkovChainBackoffClassifier(int maxOrder = 6, double quoteWeight = 0.05, double fallbackProb = 1e-9)
         {
             this.maxOrder = maxOrder;
             this.quoteWeight = quoteWeight;
             this.fallbackProb = fallbackProb;
-            transitions = new Dictionary<string, Dictionary<string, Dictionary<char, double>>>();
-            contextTotals = new Dictionary<string, Dictionary<string, double>>();
-            languageDocCount = new Dictionary<string, int>();
-            languageAlphabets = new Dictionary<string, HashSet<char>>();
+            this.preprocessor = new TextPreprocessor(maxOrder, quoteWeight);
+            this.model = new MarkovModelData();
         }
 
-        /// <summary> 
-        /// Разбивает текст на основной текст (вес 1) и цитаты (вес quoteWeight)
+        /// <summary>
+        /// Обучает модель на коллекции документов. Очищает предыдущее состояние модели.
         /// </summary>
-        private IEnumerable<(string fragment, double weight)> SplitQuotes(string text)
-        {
-            var regex = new Regex(@"«([^»]*)»|""([^""]*)""|“([^”]*)”", RegexOptions.Singleline);
-            int lastIndex = 0;
-            foreach (Match match in regex.Matches(text))
-            {
-                if (match.Index > lastIndex)
-                {
-                    string before = text.Substring(lastIndex, match.Index - lastIndex);
-                    if (!string.IsNullOrWhiteSpace(before))
-                        yield return (before, 1.0);
-                }
-                string quote = null;
-                if (match.Groups[1].Success) quote = match.Groups[1].Value;
-                else if (match.Groups[2].Success) quote = match.Groups[2].Value;
-                else if (match.Groups[3].Success) quote = match.Groups[3].Value;
-                if (!string.IsNullOrWhiteSpace(quote))
-                    yield return (quote, quoteWeight);
-                lastIndex = match.Index + match.Length;
-            }
-            if (lastIndex < text.Length)
-            {
-                string after = text.Substring(lastIndex);
-                if (!string.IsNullOrWhiteSpace(after))
-                    yield return (after, 1.0);
-            }
-        }
-
-        /// <summary> 
-        /// Очистка текста для n-грамм: только буквы и пробелы, нижний регистр 
-        /// </summary>
-        private string CleanTextForNGrams(string text)
-        {
-            if (string.IsNullOrWhiteSpace(text)) return "";
-            var sb = new StringBuilder();
-            foreach (char c in text)
-            {
-                if (char.IsLetter(c) || char.IsWhiteSpace(c))
-                    sb.Append(c);
-                else
-                    sb.Append(' ');
-            }
-            string result = sb.ToString();
-            result = Regex.Replace(result, @"\s+", " ").Trim().ToLowerInvariant();
-            return result;
-        }
-
-        /// <summary> 
-        /// Добавляет маркеры начала # для марковской цепи 
-        /// </summary>
-        private string PrepareText(string text)
-        {
-            string cleaned = CleanTextForNGrams(text);
-            if (string.IsNullOrEmpty(cleaned)) return "";
-            return new string('#', maxOrder) + cleaned;
-        }
-
-        /// <summary> 
-        /// Обучение модели на коллекции документов 
-        /// </summary>
+        /// <param name="documents">Коллекция документов с текстом и меткой языка.</param>
         public void Train(IEnumerable<LanguageDocument> documents)
         {
-            transitions.Clear();
-            contextTotals.Clear();
-            languageDocCount.Clear();
-            languageAlphabets.Clear();
-
+            model.Clear();
             foreach (var doc in documents)
             {
                 string lang = doc.Language;
-                if (!languageDocCount.ContainsKey(lang))
+                if (!model.LanguageDocCount.ContainsKey(lang))
                 {
-                    languageDocCount[lang] = 0;
-                    transitions[lang] = new Dictionary<string, Dictionary<char, double>>();
-                    contextTotals[lang] = new Dictionary<string, double>();
-                    languageAlphabets[lang] = new HashSet<char>();
+                    model.LanguageDocCount[lang] = 0;
+                    model.Transitions[lang] = new Dictionary<string, Dictionary<char, double>>();
+                    model.ContextTotals[lang] = new Dictionary<string, double>();
+                    model.LanguageAlphabets[lang] = new HashSet<char>();
                 }
-                languageDocCount[lang]++;
+                model.LanguageDocCount[lang]++;
 
-                var fragments = SplitQuotes(doc.Text).ToList();
+                var fragments = preprocessor.SplitQuotes(doc.Text).ToList();
                 foreach (var (fragment, weight) in fragments)
                 {
-                    // Сбор алфавита языка (из оригинального текста)
+                    // Сбор алфавита языка
                     foreach (char c in fragment)
                         if (char.IsLetter(c))
-                            languageAlphabets[lang].Add(char.ToLowerInvariant(c));
+                            model.LanguageAlphabets[lang].Add(char.ToLowerInvariant(c));
 
-                    string prepared = PrepareText(fragment);
+                    string prepared = preprocessor.PrepareText(fragment);
                     if (prepared.Length <= maxOrder) continue;
 
                     for (int i = maxOrder; i < prepared.Length; i++)
@@ -134,35 +67,39 @@ namespace kursachm
                         string context = prepared.Substring(i - maxOrder, maxOrder);
                         char nextChar = prepared[i];
 
-                        if (!transitions[lang].ContainsKey(context))
+                        if (!model.Transitions[lang].ContainsKey(context))
                         {
-                            transitions[lang][context] = new Dictionary<char, double>();
-                            contextTotals[lang][context] = 0;
+                            model.Transitions[lang][context] = new Dictionary<char, double>();
+                            model.ContextTotals[lang][context] = 0;
                         }
-                        if (!transitions[lang][context].ContainsKey(nextChar))
-                            transitions[lang][context][nextChar] = 0;
-                        transitions[lang][context][nextChar] += weight;
-                        contextTotals[lang][context] += weight;
+                        if (!model.Transitions[lang][context].ContainsKey(nextChar))
+                            model.Transitions[lang][context][nextChar] = 0;
+                        model.Transitions[lang][context][nextChar] += weight;
+                        model.ContextTotals[lang][context] += weight;
                     }
                 }
             }
         }
 
-        /// <summary> 
-        /// Вероятность перехода с back-off (усечение контекста) 
+        /// <summary>
+        /// Вычисляет вероятность перехода от контекста к символу с использованием back-off.
         /// </summary>
+        /// <param name="lang">Язык, для которого выполняется оценка.</param>
+        /// <param name="fullContext">Полный контекст (строка, из которой будут браться последние символы).</param>
+        /// <param name="next">Следующий символ.</param>
+        /// <returns>Вероятность перехода (не меньше fallbackProb).</returns>
         private double GetProbability(string lang, string fullContext, char next)
         {
             for (int order = maxOrder; order >= 1; order--)
             {
                 if (fullContext.Length < order) continue;
                 string context = fullContext.Substring(fullContext.Length - order, order);
-                if (transitions[lang].ContainsKey(context))
+                if (model.Transitions[lang].ContainsKey(context))
                 {
-                    var dict = transitions[lang][context];
+                    var dict = model.Transitions[lang][context];
                     if (dict.ContainsKey(next))
                     {
-                        double total = contextTotals[lang][context];
+                        double total = model.ContextTotals[lang][context];
                         return dict[next] / total;
                     }
                 }
@@ -170,16 +107,19 @@ namespace kursachm
             return fallbackProb;
         }
 
-        /// <summary> 
-        /// Суммарная логарифмическая вероятность текста для языка 
+        /// <summary>
+        /// Вычисляет логарифм вероятности того, что текст порождён указанным языком.
         /// </summary>
+        /// <param name="text">Анализируемый текст.</param>
+        /// <param name="lang">Язык.</param>
+        /// <returns>Сумма взвешенных логарифмов вероятностей переходов.</returns>
         private double LogProbability(string text, string lang)
         {
             double logProbSum = 0.0;
-            var fragments = SplitQuotes(text).ToList();
+            var fragments = preprocessor.SplitQuotes(text).ToList();
             foreach (var (fragment, weight) in fragments)
             {
-                string prep = PrepareText(fragment);
+                string prep = preprocessor.PrepareText(fragment);
                 if (prep.Length <= maxOrder) continue;
                 for (int i = maxOrder; i < prep.Length; i++)
                 {
@@ -193,9 +133,12 @@ namespace kursachm
             return logProbSum;
         }
 
-        /// <summary> 
-        /// Мягкая фильтрация языков по алфавиту (пересечение множеств букв) 
+        /// <summary>
+        /// Фильтрует список языков-кандидатов по пересечению их алфавита с буквами текста.
         /// </summary>
+        /// <param name="text">Текст, из которого извлекаются буквы.</param>
+        /// <param name="candidates">Исходный список языков.</param>
+        /// <returns>Отфильтрованный список (если пуст, возвращает исходный).</returns>
         private IEnumerable<string> FilterLanguagesByAlphabet(string text, IEnumerable<string> candidates)
         {
             var textLetters = new HashSet<char>();
@@ -208,28 +151,33 @@ namespace kursachm
             var result = new List<string>();
             foreach (var lang in candidates)
             {
-                if (!languageAlphabets.ContainsKey(lang)) continue;
-                if (languageAlphabets[lang].Overlaps(textLetters))
+                if (!model.LanguageAlphabets.ContainsKey(lang)) continue;
+                if (model.LanguageAlphabets[lang].Overlaps(textLetters))
                     result.Add(lang);
             }
             return result.Count > 0 ? result : candidates;
         }
 
-        /// <summary> 
-        /// Классификация текста: возвращает лучший язык, уверенность и топ‑5 
+        /// <summary>
+        /// Определяет язык текста, возвращает лучший язык, уверенность и топ-5 кандидатов.
         /// </summary>
+        /// <param name="text">Текст для классификации.</param>
+        /// <returns>
+        /// Кортеж: (BestLanguage, Confidence, TopCandidates), где TopCandidates — список из 5 элементов
+        /// (язык, логарифмическая оценка, вероятность).
+        /// </returns>
         public (string BestLanguage, double Confidence, List<(string Lang, double LogProb, double Prob)> TopCandidates) Classify(string text)
         {
-            if (languageDocCount.Count == 0) return (null, 0, null);
+            if (model.LanguageDocCount.Count == 0) return (null, 0, null);
 
-            int totalDocs = languageDocCount.Values.Sum();
-            var candidates = FilterLanguagesByAlphabet(text, languageDocCount.Keys);
-            if (!candidates.Any()) candidates = languageDocCount.Keys;
+            int totalDocs = model.LanguageDocCount.Values.Sum();
+            var candidates = FilterLanguagesByAlphabet(text, model.LanguageDocCount.Keys);
+            if (!candidates.Any()) candidates = model.LanguageDocCount.Keys;
 
             var scores = new Dictionary<string, double>();
             foreach (var lang in candidates)
             {
-                double prior = Math.Log((double)languageDocCount[lang] / totalDocs);
+                double prior = Math.Log((double)model.LanguageDocCount[lang] / totalDocs);
                 double likelihood = LogProbability(text, lang);
                 scores[lang] = prior + likelihood;
             }
@@ -252,6 +200,9 @@ namespace kursachm
             return (topWithProb.First().Lang, topWithProb.First().Prob, topWithProb);
         }
 
-        public IEnumerable<string> GetLanguages() => languageDocCount.Keys;
+        /// <summary>
+        /// Возвращает перечисление языков, на которых обучен классификатор.
+        /// </summary>
+        public IEnumerable<string> GetLanguages() => model.LanguageDocCount.Keys;
     }
 }
